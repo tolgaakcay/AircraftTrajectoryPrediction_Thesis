@@ -1,0 +1,19 @@
+scipy
+# requests
+numpy
+matplotlib
+seaborn
+pandas
+torch
+tensorboard
+polars
+lightning
+einops
+performer-pytorch
+omegaconf
+cdsapi>=0.7.2
+# pyarrow
+# lxml
+# boto3
+# pydantic-xml
+# psycopg
