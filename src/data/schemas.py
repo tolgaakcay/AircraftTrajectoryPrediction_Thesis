@@ -86,6 +86,18 @@ temporal_categories_schema = {
     "weekday": int,
 }
 
+#Change to OG Code - new schema for ERA5-derived en-route weather features (upper-air, per-cell,
+#per-timestep), kept separate from weather_schema/non_seq_numerical_schema which are surface-level
+#airport weather from a different data source and are not sequential
+sequential_weather_schema = {
+    "along_track_mean": float,   # trailing-window mean tailwind component (m/s)
+    "along_track_grad": float,   # timestep-to-timestep change in along_track wind (m/s per step)
+    "wind_mag_grad": float,      # timestep-to-timestep change in total wind speed (m/s per step)
+    "isa_dev_mean": float,       # trailing-window mean temperature deviation from ISA (K)
+    "isa_dev_std": float,        # trailing-window std of temperature deviation from ISA (K)
+    "isa_dev_grad": float,       # timestep-to-timestep change in ISA deviation (K per step)
+}
+
 weather_schema = {
     "winddirection_10m": float,
     "windgusts_10m": float,

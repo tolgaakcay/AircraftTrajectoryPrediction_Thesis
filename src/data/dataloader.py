@@ -24,6 +24,8 @@ def pad_collate(batch):
     outputs = []
     raw = []
     ids = []
+    wx_enc = []  #Change to OG Code - weather encoder-input batches ("_wxenc" keys)
+    wx_dec = []  #Change to OG Code - weather decoder-input batches ("_wxdec" keys)
     for data in batch:
         ids.append(data["flight_id"])
 
@@ -48,12 +50,27 @@ def pad_collate(batch):
             raw_features.append(raw_feature)
         raw.append(torch.cat(raw_features, dim=1).unsqueeze(dim=2))
 
+        #Change to OG Code - separate patterns from "_in"/"_out" so weather never gets mixed into the
+        #predicted-feature tensors above (see experiments_weather.ipynb "Plumbing plan" discussion);
+        #a no-weather dataset produces no "_wxenc"/"_wxdec" keys at all, so these stay empty lists
+        wxenc_data = list(dict(filter(lambda pair: filter_data_by_key(pair, "_wxenc"), data.items())).values())
+        if wxenc_data:
+            wxenc_features = [torch.tensor(feature, dtype=torch.long).unsqueeze(dim=1) for feature in wxenc_data]
+            wx_enc.append(torch.cat(wxenc_features, dim=1).unsqueeze(dim=2))
+
+        wxdec_data = list(dict(filter(lambda pair: filter_data_by_key(pair, "_wxdec"), data.items())).values())
+        if wxdec_data:
+            wxdec_features = [torch.tensor(feature, dtype=torch.long).unsqueeze(dim=1) for feature in wxdec_data]
+            wx_dec.append(torch.cat(wxdec_features, dim=1).unsqueeze(dim=2))
+
         # context_features = []
         # for feature in data["context_data"]:
         #     context_feature = torch.tensor([feature], dtype=torch.long).unsqueeze(dim=1)
         #     context_features.append(context_feature)
         # context.append(torch.cat(context_features, dim=1).unsqueeze(dim=2))
-    return torch.cat(inputs, dim=2), torch.cat(outputs, dim=2), ids, torch.cat(raw, dim=2)
+    wx_enc_tensor = torch.cat(wx_enc, dim=2) if wx_enc else None  #Change to OG Code - None when the dataset has no weather, matching how x_4/y_4 already use None for "not provided"
+    wx_dec_tensor = torch.cat(wx_dec, dim=2) if wx_dec else None
+    return torch.cat(inputs, dim=2), torch.cat(outputs, dim=2), ids, torch.cat(raw, dim=2), wx_enc_tensor, wx_dec_tensor
 
     
 class TrajectoryDataModule(LightningDataModule):
@@ -82,6 +99,7 @@ class TrajectoryDataModule(LightningDataModule):
                 sampling_time=dataset_kwargs["sampling_time"],
                 h3_resolution=dataset_kwargs["h3_resolution"],
                 training_columns=dataset_kwargs["training_columns"],
+                weather_data_path=dataset_kwargs.get("weather_data_path"),  #Change to OG Code - optional, defaults to None (no weather)
             )
         else:
             self.data = TrajectoryDataset(
@@ -94,7 +112,8 @@ class TrajectoryDataModule(LightningDataModule):
                 sampling_time=dataset_kwargs["sampling_time"],
                 h3_resolution=dataset_kwargs["h3_resolution"],
                 training_columns=dataset_kwargs["training_columns"],
-                columns=dataset_kwargs["columns"]
+                columns=dataset_kwargs["columns"],
+                weather_data_path=dataset_kwargs.get("weather_data_path"),  #Change to OG Code - optional, defaults to None (no weather)
             )
             
         self.train_data, self.val_data , self.test_data = random_split(

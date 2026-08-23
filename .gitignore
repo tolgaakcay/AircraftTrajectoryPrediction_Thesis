@@ -1,3 +1,7 @@
-./src/secrets.conf
-./src/data/raw/
+/src/secrets.conf
+/src/data/raw/
+/src/data/weather/
+/src/models/checkpoints/
 .venv/
+/CLAUDE.md
+*:Zone.Identifier

@@ -11,8 +11,7 @@ from torchtext.vocab import vocab
 from collections import Counter, OrderedDict
 
 import numpy as np
-from sklearn.preprocessing import QuantileTransformer, FunctionTransformer
-from sklearn_pandas import DataFrameMapper
+from sklearn.preprocessing import QuantileTransformer
 
 import numpy as np
 from numpy.typing import ArrayLike
@@ -27,6 +26,7 @@ from src.data.schemas import (
     non_seq_numerical_schema,
     flight_categories_schema,
     temporal_categories_schema,
+    sequential_weather_schema,  #Change to OG Code - for the sequential ERA5 weather features
 )
 
 MAX_ALTITUDE = 43100    # ft
@@ -43,6 +43,12 @@ FLIGHT_CATEGORICAL_COLUMNS = list(flight_categories_schema.keys())
 NON_SEQ_NUM_COLUMNS = list(non_seq_numerical_schema.keys())
 TIME_CATEGORY_COLUMNS = list(temporal_categories_schema.keys())
 TRAINING_COLUMNS = list(training_trajectories_schema.keys())
+SEQUENTIAL_WEATHER_COLUMNS = list(sequential_weather_schema.keys())  #Change to OG Code - engineered ERA5 feature names, encoded but never predicted
+
+TROPOPAUSE_HEIGHT_M = 11_000  #Change to OG Code - ISA deviation constants (Feature set section of CLAUDE.md)
+ISA_SEA_LEVEL_TEMP_K = 288.15
+ISA_LAPSE_RATE_K_PER_M = 0.0065
+ISA_TROPOPAUSE_TEMP_K = 216.65
 
 WEIRD_IDS_NOT_FILTERED = [
     'AFR83EE_057_2024_10_23',
@@ -191,6 +197,8 @@ class TrajectoryDataset(Dataset):
         h3_resolution: Literal["5", "6", "7", "8", "9", "10", "11", "multi"]="5",
         training_columns: list[str] = TRAINING_COLUMNS,
         columns: list[str] = TRAJECTORY_COLUMNS,
+        weather_data_path: str | None = None,  #Change to OG Code - path to a trajectory_weather_features_*.parquet; None means no weather (fully backward compatible)
+        weather_columns: list[str] = SEQUENTIAL_WEATHER_COLUMNS,
     ) -> None:
         self.destination = destination
         self.start = start
@@ -206,12 +214,26 @@ class TrajectoryDataset(Dataset):
         self.columns = columns
         self.feature_columns = columns
         self.columns_idxs = {col: idx for idx, col in enumerate(self.columns)}
-        
-        self.scalers = [QuantileTransformer(output_distribution="normal") for _ in range(5)]
+
+        #Change to OG Code - random_state pinned: QuantileTransformer subsamples internally using the
+        #unseeded global numpy random state, so vocab sizes (and thus embedding/dense layer dimensions)
+        #were silently different every process run, making every saved checkpoint unloadable after a
+        #kernel restart. Confirmed empirically: two runs on identical data gave altitude vocab sizes of
+        #1783 vs 1789. 42 matches the manual_seed(42) already used for the train/val/test split.
+        self.scalers = [QuantileTransformer(output_distribution="normal", random_state=42) for _ in range(5)]
+
+        #Change to OG Code - weather is off by default; when a path is given, weather_columns get their own
+        #scalers (separate from the 5 fixed lat/lon/altitude/x/y ones above) and their own vocabs, and are
+        #encoded into the model but never predicted (see CLAUDE.md "Weather integration design")
+        self.use_weather = weather_data_path is not None
+        self.weather_data_path = weather_data_path
+        self.weather_columns = weather_columns if self.use_weather else []
+        self.weather_scalers = [QuantileTransformer(output_distribution="normal", random_state=42) for _ in self.weather_columns]
 
         self.trajectory_features = None
 
         self._read_data()
+        self._attach_weather_features()  #Change to OG Code - no-op when use_weather is False
         self._transform_data()
 
 
@@ -278,13 +300,15 @@ class TrajectoryDataset(Dataset):
                     source=self.data_source,
                     hive_schema={
                         "destination": pl.String,
-                        "year": pl.Int32,
-                        "month": pl.Int32,
-                        "day": pl.Int32,
-                    },
+                        "year": pl.Int64,
+                        "month": pl.Int64,
+                        "day": pl.Int64,
+                    }, #Changed from OG Code - Int64 used instead of Int32
+                    cast_options=pl.ScanCastOptions(datetime_cast='nanosecond-downcast'), #Addition to OG Code - Downcast the ns columns to match start_timestamp across all partitions
                 )
                 .select([*self.columns, *additional_columns])
                 .filter(partitions_to_read)
+                .filter(pl.col("destination") == self.destination) #Addition to OG Code - Additional filter added to stop other airport data from leaking in.
                 .with_columns(
                     pl.struct(["start_timestamp", "timestamp"]).map_elements(
                         lambda row: num_sampling_point(
@@ -312,12 +336,12 @@ class TrajectoryDataset(Dataset):
                             self.h3_resolution
                         ))
                     ).alias("h3_cell"),
-                    pl.struct(["dist_from_orig","dist_to_dest"]).map_elements(
-                        lambda x: far_from_airport(x["dist_from_orig"], x["dist_to_dest"])
+                    (
+                        (pl.col("dist_from_orig") > 5) & (pl.col("dist_to_dest") > 5)
                     ).alias("far_from_airport"),
                 )
                 .filter(
-                    (pl.col("far_from_airport") == True) &
+                    pl.col("far_from_airport") &
                     (pl.col("latitude") >= MIN_LAT) &
                     (pl.col("latitude") <= MAX_LAT) &
                     (pl.col("longitude") >= MIN_LON) &
@@ -329,7 +353,7 @@ class TrajectoryDataset(Dataset):
                 )
                 .select(
                     pl.col("flight_id"),
-                    pl.col("timestamp").dt.datetime(),
+                    pl.col("timestamp").dt.replace_time_zone(None), #Change from OG code - Datetime deprecated, replacing it.
                     pl.col("latitude").cast(pl.Float32),
                     pl.col("longitude").cast(pl.Float32),
                     pl.col("altitude").cast(pl.Float32),
@@ -347,17 +371,69 @@ class TrajectoryDataset(Dataset):
                     pl.col("unix_timestamp"),
                     pl.col("origin"),
                     number_points=pl.col("num_sampled_points").cast(pl.Int64),
-                    diff_time=(pl.col("timestamp") - pl.col("start_timestamp")).dt.total_seconds(),
+                    diff_time=((pl.col("timestamp") - pl.col("start_timestamp")).dt.total_seconds().cast(pl.Int64)), #Change from OG code - Forced diff_time to integer seconds.
                     year=pl.col("timestamp").dt.year().cast(pl.Int16),
                     month=pl.col("timestamp").dt.month().cast(pl.Int8),
                     day=pl.col("timestamp").dt.day().cast(pl.Int8),
                 )
-                .fill_null(strategy="forward")
+                .filter((pl.col("diff_time").cast(pl.Int64) % self.sampling_time) == 0) #Change from OG Code
                 .filter((pl.col("diff_time") % self.sampling_time) == 0)
             )
             .collect()
         )
-    
+
+    def _attach_weather_features(self) -> None:
+        """Change to OG Code - left-join ERA5 weather (u,v,t,gps_altitude_m already exact-altitude
+        interpolated per trajectory point, see h3_alt_layer_generation.ipynb) onto self.data by
+        (flight_id, timestamp), then derive the engineered feature set from CLAUDE.md's "Feature set"
+        section: along-track wind and ISA-deviation temperature, each as a trailing rolling
+        mean/std over the input window plus a step-to-step time gradient. Weather is a known
+        covariate for the model (see "Weather integration design"), never a prediction target."""
+        if not self.use_weather:
+            return
+
+        weather = pl.read_parquet(self.weather_data_path).select(
+            pl.col("flight_id"),
+            pl.col("timestamp").cast(pl.Datetime("us")),  #Change to OG Code - explicit cast, known datetime-precision hazard
+            pl.col("u"), pl.col("v"), pl.col("t"),
+        )
+        self.data = self.data.with_columns(pl.col("timestamp").cast(pl.Datetime("us")))
+
+        n_before = self.data.height
+        self.data = self.data.join(weather, on=["flight_id", "timestamp"], how="left")
+        n_unmatched = self.data.filter(pl.col("u").is_null()).height
+        if n_unmatched:
+            raise ValueError(
+                f"{n_unmatched} of {n_before} trajectory points have no matching weather row "
+                f"(joined on flight_id, timestamp against {self.weather_data_path}). "
+                f"start/end here must be within the weather file's own date range."
+            )
+
+        track_rad = (pl.col("track") * np.pi / 180.0)
+        along_track = pl.col("u") * track_rad.sin() + pl.col("v") * track_rad.cos()
+        wind_magnitude = (pl.col("u") ** 2 + pl.col("v") ** 2).sqrt()
+        t_isa = (
+            pl.when(pl.col("gps_altitude") <= TROPOPAUSE_HEIGHT_M)
+            .then(ISA_SEA_LEVEL_TEMP_K - ISA_LAPSE_RATE_K_PER_M * pl.col("gps_altitude"))
+            .otherwise(ISA_TROPOPAUSE_TEMP_K)
+        )
+        isa_dev = pl.col("t") - t_isa
+
+        self.data = (
+            self.data
+            .sort(["flight_id", "timestamp"])
+            .with_columns(along_track.alias("_along_track"), wind_magnitude.alias("_wind_mag"), isa_dev.alias("_isa_dev"))
+            .with_columns(
+                pl.col("_along_track").rolling_mean(window_size=self.input_len, min_periods=1).over("flight_id").alias("along_track_mean"),
+                pl.col("_isa_dev").rolling_mean(window_size=self.input_len, min_periods=1).over("flight_id").alias("isa_dev_mean"),
+                pl.col("_isa_dev").rolling_std(window_size=self.input_len, min_periods=1).over("flight_id").fill_null(0.0).alias("isa_dev_std"),
+                (pl.col("_along_track").diff().over("flight_id") / pl.col("diff_time").diff().over("flight_id")).fill_null(0.0).fill_nan(0.0).alias("along_track_grad"),
+                (pl.col("_wind_mag").diff().over("flight_id") / pl.col("diff_time").diff().over("flight_id")).fill_null(0.0).fill_nan(0.0).alias("wind_mag_grad"),
+                (pl.col("_isa_dev").diff().over("flight_id") / pl.col("diff_time").diff().over("flight_id")).fill_null(0.0).fill_nan(0.0).alias("isa_dev_grad"),
+            )
+            .drop("_along_track", "_wind_mag", "_isa_dev", "u", "v", "t")
+        )
+
     def _transform_data(self):
         transformed_data = (
             self.data.select(
@@ -370,6 +446,7 @@ class TrajectoryDataset(Dataset):
                 pl.col("timestamp"),
                 pl.col("h3_cell").map_elements(lambda x: str(x) ),
                 pl.col("diff_time").map_elements(lambda x: str(x)),
+                *[pl.col(c) for c in self.weather_columns],  #Change to OG Code - carry the engineered weather columns through
                 x_raw=pl.col("x"),
                 y_raw=pl.col("y"),
                 z_raw=pl.col("z"),
@@ -378,18 +455,18 @@ class TrajectoryDataset(Dataset):
                 gps_altitude_raw=pl.col("gps_altitude")
             )
         ).to_pandas()
-        
-        
-        mapper = DataFrameMapper([
-            (["latitude"], self.scalers[0]),
-            (["longitude"], self.scalers[1]),
-            (["altitude"], self.scalers[2]),
-            (["x"], self.scalers[3]),
-            (["y"], self.scalers[4]),
-            (["flight_id", "timestamp", "h3_cell", "diff_time", "x_raw", "y_raw", "z_raw", "latitude_raw", "longitude_raw", "gps_altitude_raw"], FunctionTransformer(lambda x: x))
-        ])
-        scaled_features = mapper.fit_transform(transformed_data.copy())
-        scaled_data = pd.DataFrame(scaled_features, index=transformed_data.index, columns=transformed_data.columns).sort_values(["flight_id", "timestamp", "diff_time"])
+
+
+        numeric_cols = ["latitude", "longitude", "altitude", "x", "y"]
+        passthrough_cols = ["flight_id", "timestamp", "h3_cell", "diff_time", "x_raw", "y_raw", "z_raw", "latitude_raw", "longitude_raw", "gps_altitude_raw"]
+
+        scaled_data = transformed_data.copy()
+        for col, scaler in zip(numeric_cols, self.scalers):
+            scaled_data[col] = scaler.fit_transform(scaled_data[[col]])
+        for col, scaler in zip(self.weather_columns, self.weather_scalers):  #Change to OG Code - weather gets its own scaler set, same fit_transform pattern
+            scaled_data[col] = scaler.fit_transform(scaled_data[[col]])
+
+        scaled_data = scaled_data[numeric_cols + self.weather_columns + passthrough_cols].sort_values(["flight_id", "timestamp", "diff_time"])
         self.transformed_data = scaled_data.drop_duplicates(subset=["latitude", "longitude", "altitude", "x", "y", "flight_id", "timestamp", "h3_cell"], keep="last")
 
         self.mins = self.transformed_data[["latitude", "longitude", "altitude", "x", "y"]].min().to_numpy().astype(np.float32)
@@ -398,12 +475,15 @@ class TrajectoryDataset(Dataset):
         self.transformed_data["altitude"] = self.transformed_data["altitude"].apply(lambda x: str(round(x - self.mins[2], 3)))
         self.transformed_data["x"] = self.transformed_data["x"].apply(lambda x: str(round(x - self.mins[3], 3)))
         self.transformed_data["y"] = self.transformed_data["y"].apply(lambda x: str(round(x - self.mins[4], 3)))
-        
-        
-        
+
+        #Change to OG Code - same "subtract min, round, stringify" binning as the block above, looped over the weather columns
+        self.weather_mins = self.transformed_data[self.weather_columns].min().to_numpy().astype(np.float32) if self.weather_columns else np.array([])
+        for i, col in enumerate(self.weather_columns):
+            self.transformed_data[col] = self.transformed_data[col].apply(lambda x, i=i: str(round(x - self.weather_mins[i], 3)))
+
         self.vocabs = {
-            feature_name: self._build_vocab(Counter(self.transformed_data[feature_name].to_list()), specials=["START", "END", "PAD"]) 
-            for feature_name in ["latitude", "longitude", "altitude", "x", "y", "diff_time", "h3_cell"]
+            feature_name: self._build_vocab(Counter(self.transformed_data[feature_name].to_list()), specials=["START", "END", "PAD"])
+            for feature_name in ["latitude", "longitude", "altitude", "x", "y", "diff_time", "h3_cell", *self.weather_columns]
         }
 
         self.transformed_data["diff_time"] = self.transformed_data["diff_time"].apply(lambda x: self.vocabs["diff_time"][x])
@@ -411,6 +491,8 @@ class TrajectoryDataset(Dataset):
         self.transformed_data["longitude"] = self.transformed_data["longitude"].apply(lambda x: self.vocabs["longitude"][x])
         self.transformed_data["altitude"] = self.transformed_data["altitude"].apply(lambda x: self.vocabs["altitude"][x])
         self.transformed_data["x"] = self.transformed_data["x"].apply(lambda x: self.vocabs["x"][x])
+        for col in self.weather_columns:  #Change to OG Code - vocab lookup for weather, same pattern as the columns above
+            self.transformed_data[col] = self.transformed_data[col].apply(lambda x, col=col: self.vocabs[col][x])
         self.transformed_data["y"] = self.transformed_data["y"].apply(lambda x: self.vocabs["y"][x])
         self.transformed_data["h3_cell"] = self.transformed_data["h3_cell"].apply(lambda x: self.vocabs["h3_cell"][x])
 
@@ -419,7 +501,7 @@ class TrajectoryDataset(Dataset):
             pl.from_pandas(self.transformed_data)
             .sort(["flight_id", "timestamp"])
             .group_by("flight_id", maintain_order=True)
-            .agg([*self.training_columns, "x_raw", "y_raw", "z_raw", "latitude_raw", "longitude_raw", "gps_altitude_raw"])
+            .agg([*self.training_columns, "x_raw", "y_raw", "z_raw", "latitude_raw", "longitude_raw", "gps_altitude_raw", *self.weather_columns])  #Change to OG Code - weather columns appended last, see __getitem__ offset
         ).to_numpy()
 
     def __len__(self) -> int:
@@ -452,7 +534,24 @@ class TrajectoryDataset(Dataset):
             for idx, col_name in enumerate(self.training_columns)
         }
 
+        #Change to OG Code - weather encoder input (matches x_i: plain input_len slice, no START/END) and
+        #weather decoder input (matches the target window, but no START/END either - weather is never
+        #autoregressively generated, it's fully known upfront, see the "Plumbing plan" discussion). Keyed
+        #with "_wxenc"/"_wxdec" rather than "_in"/"_out" so pad_collate (dataloader.py) routes them to
+        #their own tensors instead of getting silently mixed into the predicted-feature tensors.
+        weather_offset = len(self.training_columns) + 6 + 1
+        weather_encoder_data = {
+            f"{col_name}_wxenc": trajectory_data[idx + weather_offset][:self.input_len]
+            for idx, col_name in enumerate(self.weather_columns)
+        }
+        weather_decoder_data = {
+            f"{col_name}_wxdec": trajectory_data[idx + weather_offset][self.input_len:self.input_len + self.target_len]
+            for idx, col_name in enumerate(self.weather_columns)
+        }
+
         item_data = dict(input_data, **output_data)
         item_data.update(raw_data)
+        item_data.update(weather_encoder_data)
+        item_data.update(weather_decoder_data)
         item_data["flight_id"] = trajectory_data[0]
         return item_data
