@@ -4,7 +4,7 @@ import torch
 from torch.utils.data import DataLoader, Dataset, random_split
 from pytorch_lightning import LightningDataModule
 
-from src.data.dataset import TrajectoryDataset
+from src.data.dataset import TrajectoryDataset, SEQUENTIAL_WEATHER_COLUMNS
 
 
 logging.basicConfig()
@@ -100,6 +100,7 @@ class TrajectoryDataModule(LightningDataModule):
                 h3_resolution=dataset_kwargs["h3_resolution"],
                 training_columns=dataset_kwargs["training_columns"],
                 weather_data_path=dataset_kwargs.get("weather_data_path"),  #Change to OG Code - optional, defaults to None (no weather)
+                weather_columns=dataset_kwargs.get("weather_columns", SEQUENTIAL_WEATHER_COLUMNS),  #Change to OG Code - lets a caller train on a subset of engineered weather features; defaults to all 6 when omitted
             )
         else:
             self.data = TrajectoryDataset(
@@ -114,6 +115,7 @@ class TrajectoryDataModule(LightningDataModule):
                 training_columns=dataset_kwargs["training_columns"],
                 columns=dataset_kwargs["columns"],
                 weather_data_path=dataset_kwargs.get("weather_data_path"),  #Change to OG Code - optional, defaults to None (no weather)
+                weather_columns=dataset_kwargs.get("weather_columns", SEQUENTIAL_WEATHER_COLUMNS),  #Change to OG Code - lets a caller train on a subset of engineered weather features; defaults to all 6 when omitted
             )
             
         self.train_data, self.val_data , self.test_data = random_split(
