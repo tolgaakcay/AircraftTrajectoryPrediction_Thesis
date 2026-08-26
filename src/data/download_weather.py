@@ -79,8 +79,8 @@ def compute_area_from_trajectories(
  
     return [round(north, 2), round(west, 2), round(south, 2), round(east, 2)]
  
-START_DATE = datetime(year=2024, month=10, day=16)
-END_DATE = datetime(year=2024, month=10, day=30)
+START_DATE = datetime(year=2024, month=11, day=1)
+END_DATE = datetime(year=2024, month=11, day=6)
 
 num_days = (END_DATE - START_DATE).days
 date_list = [

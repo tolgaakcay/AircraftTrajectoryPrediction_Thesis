@@ -419,6 +419,13 @@ class TrajectoryDataset(Dataset):
         )
         isa_dev = pl.col("t") - t_isa
 
+        #Change to OG Code - display-only weather columns (wind speed/direction, temperature in C),
+        #not part of training_columns/weather_columns so they don't affect the model at all. Kept
+        #around after u/v/t are dropped, purely so map hover_data (experiments_weather.ipynb) can
+        #show human-readable weather instead of nothing. Wind direction is meteorological convention
+        #(compass bearing the wind blows FROM, not toward), verified against known cases.
+        wind_direction = ((pl.arctan2(pl.col("u"), pl.col("v")).degrees() + 180) % 360)
+
         self.data = (
             self.data
             .sort(["flight_id", "timestamp"])
@@ -430,6 +437,9 @@ class TrajectoryDataset(Dataset):
                 (pl.col("_along_track").diff().over("flight_id") / pl.col("diff_time").diff().over("flight_id")).fill_null(0.0).fill_nan(0.0).alias("along_track_grad"),
                 (pl.col("_wind_mag").diff().over("flight_id") / pl.col("diff_time").diff().over("flight_id")).fill_null(0.0).fill_nan(0.0).alias("wind_mag_grad"),
                 (pl.col("_isa_dev").diff().over("flight_id") / pl.col("diff_time").diff().over("flight_id")).fill_null(0.0).fill_nan(0.0).alias("isa_dev_grad"),
+                pl.col("_wind_mag").alias("wind_speed_ms"),
+                wind_direction.alias("wind_direction_deg"),
+                (pl.col("t") - 273.15).alias("temperature_C"),
             )
             .drop("_along_track", "_wind_mag", "_isa_dev", "u", "v", "t")
         )
