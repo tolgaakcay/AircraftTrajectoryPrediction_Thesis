@@ -134,7 +134,7 @@ WEIRD_IDS_NOT_FILTERED = [
 ]
 
 
-def far_from_airport(dist_from_orig, dist_to_dest, threshold = 5):
+def far_from_airport(dist_from_orig, dist_to_dest, threshold = 80):  #Change to OG Code - Soares used 80 km, not 5; this default was never actually wired to the pipeline (see the inline filter below), but bumped for consistency
     if dist_from_orig > threshold and dist_to_dest > threshold:
         return True
     return False
@@ -337,8 +337,8 @@ class TrajectoryDataset(Dataset):
                         ))
                     ).alias("h3_cell"),
                     (
-                        (pl.col("dist_from_orig") > 5) & (pl.col("dist_to_dest") > 5)
-                    ).alias("far_from_airport"),
+                        (pl.col("dist_from_orig") > 80) & (pl.col("dist_to_dest") > 80)
+                    ).alias("far_from_airport"),  #Change to OG Code - Soares used 80 km from both origin and destination, not 5; this inline expression is the one that actually runs
                 )
                 .filter(
                     pl.col("far_from_airport") &
@@ -378,6 +378,14 @@ class TrajectoryDataset(Dataset):
                 )
                 .filter((pl.col("diff_time").cast(pl.Int64) % self.sampling_time) == 0) #Change from OG Code
                 .filter((pl.col("diff_time") % self.sampling_time) == 0)
+                #Change to OG Code - num_sampled_points (used in the length filter above) is computed
+                #from flight duration / sampling_time *before* far_from_airport trims points, so a
+                #flight can pass that filter on duration alone and still end up too short once its
+                #airport-proximity points are dropped. Re-check length here, after every point-dropping
+                #filter has run, so it counts points that actually survive to training. Without this,
+                #pad_collate raises "Sizes of tensors must match except in dimension 2" on the resulting
+                #short flights.
+                .filter(pl.len().over("flight_id") >= (self.input_len + self.target_len))
             )
             .collect()
         )

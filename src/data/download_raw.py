@@ -1,5 +1,10 @@
 # %%
+# This Python file has been duplicated from the original "download_raw.py" by Natalia Souares
+# Its purpose is to increase the 36-day data period from the original file to 120-days and observe the difference in accuracy of complexity increase in data.
+# Project done by Tolga Akcay for the Chair of Big Geospatial Data at the Technical University of Munich in 2026.
+
 from __future__ import annotations
+from pathlib import Path
 
 import os
 import argparse
@@ -40,9 +45,9 @@ os.environ["trino_username"] = config["opensky"]["username"]
 os.environ["trino_password"] = config["opensky"]["password"]
 
 # %%
-DESTINATION = "LFBO"
-START_DATE = datetime(year=2024, month=10, day=1)
-END_DATE = datetime(year=2024, month=11, day=6)
+DESTINATION = "EDJA"  #Change from Original Code 
+START_DATE = datetime(year=2024, month=10, day=2) #Change from Original Code  
+END_DATE = datetime(year=2024, month=10, day=6) #Change from Original Code 
 
 ADSB_SCHEMA = list(adsb_schema.keys())
 WEATHER_COLUMNS = list(weather_schema.keys())
@@ -114,6 +119,16 @@ COLUMNS_AGGREGATION = {
 }
 
 EARTH_RADIUS_M = 6378000
+
+def download_check(airport: str, day: datetime, raw_path: str = "./raw") -> bool:
+    partition_dir = (
+        Path(raw_path)
+        / f"destination={airport}"
+        / f"year={day.year}"
+        / f"month={day.month}"
+        / f"day={day.day}"
+    )
+    return partition_dir.is_dir() and any(partition_dir.glob("*.parquet"))
 
 # %%
 def limit_values(value, min_threshold, max_threshold):
@@ -242,7 +257,8 @@ def resample_times(traffic_data: Traffic, rule: str | int = "1min"):
 def check_go_arounds(flight: Flight) -> bool:
     try: 
         has_go_around = flight.go_around(DESTINATION).has()
-    except TypeError:
+    except (TypeError, ValueError) as e:
+        print(f"go_around check failed for {flight.flight_id}: {e}")
         has_go_around = False
     return has_go_around
 
@@ -317,7 +333,7 @@ def download_opensky_data(
         (adsb_df.origin != adsb_df.destination)
     ]
 
-    aligned_opensky_data = opensky_data.all(f"aligned_on_{airport}").eval()
+    aligned_opensky_data = opensky_data.all(f'aligned_on_ils("{airport}")').eval()
     rnwy_df = (
         aligned_opensky_data
         .rename(columns={"ILS": "landing_runway", "bearing": "landing_bearing"})
@@ -406,7 +422,11 @@ for i, start in enumerate(date_list):
     end = date_list[next_id]
     if end == start:
         end = start + timedelta(days=1)
-    print(start, end)
+
+    if download_check(DESTINATION, start):
+        print(f"SKIP  {start.date()} (already downloaded)")
+        continue
+    print(f"FETCH {start.date()} → {end.date()}")
 
     try:
         opensky_data = download_opensky_data(
@@ -484,7 +504,10 @@ for i, start in enumerate(date_list):
             partition_cols=["destination", "year", "month", "day"],
             index=False,
         )
-    except AttributeError:
+    except AttributeError as e:
+        import traceback
+        print(f"SKIPPED {start.date()}: {type(e).__name__}: {e}") #Addition to OG Code - Skip failed days, then print the type of error experienced.
+        traceback.print_exc()
         continue
 
 # %%
